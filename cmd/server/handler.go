@@ -32,6 +32,14 @@ func makeHandler(db database) http.Handler {
 					return "", false
 				}
 				switch req.Method {
+				case http.MethodGet:
+					key, ok := getTargetKey()
+					if !ok {
+						return
+					}
+					// TODO(seh): Implement Get.
+					fmt.Fprintf(w, "Key: %q\n", key)
+					return
 				case http.MethodPost:
 					if err := req.ParseForm(); err != nil {
 						w.WriteHeader(http.StatusBadRequest)
@@ -92,6 +100,12 @@ func makeHandler(db database) http.Handler {
 						return
 					}
 					// TODO(seh): Implement Delete.
+				default:
+					w.WriteHeader(http.StatusBadRequest)
+					// TODO(seh): Write this as JSON.
+					speakPlainTextTo(w)
+					fmt.Fprintf(w, "Request uses disallowed HTTP method %q\n", req.Method)
+					return
 				}
 			}))
 	}

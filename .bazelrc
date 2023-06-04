@@ -1,0 +1,7 @@
+#TODO(seh): Remove this once we're using Bazel version 7.
+common --enable_bzlmod
+build --stamp
+# TODO(seh): Extract variable values from Git status.
+#build --workspace_status_command=print-workspace-status
+
+try-import %workspace%/user.bazelrc

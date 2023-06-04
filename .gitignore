@@ -1,0 +1,9 @@
+/bazel-bin
+/bazel-out
+/bazel-testlogs
+/bazel-wva
+/user.bazelrc
+
+.DS_Store
+
+

@@ -10,9 +10,9 @@ import (
 	"sync"
 	"syscall"
 
-	"seh/db/internal/db"
-
 	flag "github.com/spf13/pflag"
+
+	"sehlabs.com/db/internal/db"
 )
 
 func fatal(code int, m string) {
@@ -117,10 +117,11 @@ func main() {
 		}
 	}
 	// TODO(seh): Wrap with OpenTelemetry instrumentation.
-	db := db.Handle{
-		// TODO(seh): Initialize this properly.
+	store, err := db.MakeShardedStore()
+	if err != nil {
+		fatalf(1, "Failed to create database: %v", err)
 	}
-	handler := makeHandler(&db)
+	handler := makeHandler(store)
 	if err := runHTTPServer(serverAddress, serverPort, serverTLSConfig, handler, ctx.Done()); err != nil {
 		fatalf(1, "HTTP server failed: %v", err)
 	}

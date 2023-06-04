@@ -1,4 +1,4 @@
-module seh/db
+module sehlabs.com/db
 
 go 1.20
 
