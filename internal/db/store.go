@@ -7,16 +7,6 @@ import (
 	"hash/maphash"
 )
 
-func copyInto[V ~[]byte, U ~[]byte](dst *V, v U) int {
-	length := len(v)
-	if cap(*dst) < length {
-		*dst = make([]byte, length)
-	} else if len(*dst) != length {
-		*dst = (*dst)[:length]
-	}
-	return copy(*dst, v)
-}
-
 // A KeyShardProjection is a projection function from a given database key to an opaque value with
 // which to assign the key to a storage shard.
 type KeyShardProjection func(Key) uint64
@@ -183,7 +173,7 @@ func (t *shardedStoreTransaction) Insert(ctx context.Context, k Key, v Value) er
 			proposedVersion := recordVersion{
 				next: expectedNewest,
 			}
-			copyInto(&proposedVersion.value, v)
+			proposedVersion.value.CopyFrom(v)
 			if !record.newest.CompareAndSwap(expectedNewest, &proposedVersion) {
 				// Someone else stored a new version before us.
 				return transactionInConflictError(k)
@@ -205,7 +195,7 @@ func (t *shardedStoreTransaction) Insert(ctx context.Context, k Key, v Value) er
 					return recordExistsError(k)
 				case validBefore == t.id:
 					// It looks like we deleted this record during this transaction.
-					copyInto(&r.value, v)
+					r.value.CopyFrom(v)
 					r.validBeforeTransaction.Store(uint64(noSuchTransaction))
 					return nil
 				default:
@@ -260,7 +250,7 @@ func (t *shardedStoreTransaction) Insert(ctx context.Context, k Key, v Value) er
 		return useExistingRecord(record)
 	}
 	var proposedVersion recordVersion
-	copyInto(&proposedVersion.value, v)
+	proposedVersion.value.CopyFrom(v)
 	var proposedRecord versionedRecord
 	proposedRecord.newest.Store(&proposedVersion)
 	rm.recordsByKey[string(k)] = &proposedRecord
@@ -277,73 +267,66 @@ func (t *shardedStoreTransaction) Update(ctx context.Context, k Key, v Value) er
 	if !ok {
 		return recordDoesNotExistError(k)
 	}
-inspectNewest:
-	for {
-		r := record.newest.Load()
-		if r == nil {
-			return recordDoesNotExistError(k)
-		}
-		switch validAsOf := r.validAsOfTransactionID(); {
-		case validAsOf == noSuchTransaction:
-			if !t.hasPendingWriteAgainst(k) {
-				// A different transaction is trying to write to this record.
-				return transactionInConflictError(k)
-			}
-			switch validBefore := r.validBeforeTransactionID(); {
-			case validBefore == noSuchTransaction:
-				// Update the previously proposed value in place.
-				copyInto(&r.value, v)
-				return nil
-			case validBefore <= t.id:
-				// Someone else already deleted the record by marking it as a tombstone.
-				return recordDoesNotExistError(k)
-			default:
-				// For some reason, the pending record version would be valid for ours and maybe
-				// even for later transactions, even though our transaction is supposedly
-				// working on this record. Preclude further interference by giving up.
-				return fmt.Errorf("transaction with ID %d found pending record version for %q with later validity period ending with transaction %d", t.id, k, validBefore)
-			}
-		case validAsOf <= t.id:
-			proposeUpdate := func() bool {
-				proposedNewest := recordVersion{
-					next: r,
-				}
-				copyInto(&proposedNewest.value, v)
-				if record.newest.CompareAndSwap(r, &proposedNewest) {
-					t.notePendingWriteAgainst(k)
-					return true
-				}
-				return false
-			}
-			for {
-				switch validBefore := r.validAsOfTransactionID(); {
-				case validBefore == noSuchTransaction:
-					if proposeUpdate() {
-						return nil
-					}
-					// Someone else added a newer version.
-					return transactionInConflictError(k)
-				case validBefore <= t.id:
-					// Someone else deleted the record by marking it as a tombstone.
-					return recordDoesNotExistError(k)
-				default:
-					// Someone changed or deleted this record in a later transaction. If we can
-					// create a pending update, we'll update it and pull the validity horizon back
-					// to this current transaction upon commit.
-					if proposeUpdate() {
-						return nil
-					}
-					// Someone else created a new version, which may still be pending. We'll try
-					// again.
-					continue inspectNewest
-				}
-			}
-		default:
-			// NB: We don't walk backward through versions to try to find one that covers our
-			// transaction. If we do, and we find one, we allow an update when subsequent
-			// transactions have changed this record, violating the "snapshot" isolation protocol.
+	r := record.newest.Load()
+	if r == nil {
+		return recordDoesNotExistError(k)
+	}
+	switch validAsOf := r.validAsOfTransactionID(); {
+	case validAsOf == noSuchTransaction:
+		if !t.hasPendingWriteAgainst(k) {
+			// A different transaction is trying to write to this record.
 			return transactionInConflictError(k)
 		}
+		switch validBefore := r.validBeforeTransactionID(); {
+		case validBefore == noSuchTransaction:
+			// Update the previously proposed value in place.
+			r.value.CopyFrom(v)
+			return nil
+		case validBefore <= t.id:
+			// Someone else already deleted the record by marking it as a tombstone.
+			return recordDoesNotExistError(k)
+		default:
+			// For some reason, the pending record version would be valid for ours and maybe
+			// even for later transactions, even though our transaction is supposedly
+			// working on this record. Preclude further interference by giving up.
+			return fmt.Errorf("transaction with ID %d found pending record version for %q with later validity period ending with transaction %d", t.id, k, validBefore)
+		}
+	case validAsOf <= t.id:
+		proposeUpdate := func() bool {
+			proposedNewest := recordVersion{
+				next: r,
+			}
+			proposedNewest.value.CopyFrom(v)
+			if record.newest.CompareAndSwap(r, &proposedNewest) {
+				t.notePendingWriteAgainst(k)
+				return true
+			}
+			return false
+		}
+		for {
+			switch validBefore := r.validBeforeTransactionID(); {
+			case validBefore == noSuchTransaction:
+				if proposeUpdate() {
+					return nil
+				}
+				// Someone else added a newer version.
+				return transactionInConflictError(k)
+			case validBefore <= t.id:
+				// Someone else deleted the record by marking it as a tombstone.
+				return recordDoesNotExistError(k)
+			default:
+				// A later transaction deleted or invalidated this version. Since it's possible
+				// that intervening transactions have observed this version being valid and made
+				// decisions based upon that finding, we can't just pull back the validity
+				// horizon here.
+				return transactionInConflictError(k)
+			}
+		}
+	default:
+		// NB: We don't walk backward through versions to try to find one that covers our
+		// transaction. If we do, and we find one, we allow an update when subsequent
+		// transactions have changed this record, violating the "snapshot" isolation protocol.
+		return transactionInConflictError(k)
 	}
 }
 
@@ -376,72 +359,67 @@ func (t *shardedStoreTransaction) Delete(ctx context.Context, k Key) (error, boo
 	if !ok {
 		return nil, false
 	}
-inspectNewest:
-	for {
-		r := record.newest.Load()
-		if r == nil {
-			return nil, false
-		}
-		switch validAsOf := r.validAsOfTransactionID(); {
-		case validAsOf == noSuchTransaction:
-			if !t.hasPendingWriteAgainst(k) {
-				// A different transaction is trying to write to this record.
-				return transactionInConflictError(k), false
-			}
-			for {
-				switch validBefore := r.validBeforeTransactionID(); {
-				case validBefore == noSuchTransaction:
-					if r.validBeforeTransaction.CompareAndSwap(uint64(noSuchTransaction), uint64(t.id)) {
-						return nil, true
-					}
-					// Someone else changed the validity horizon. We'll try again.
-				case validBefore <= t.id:
-					// Someone else already deleted the record by marking it as a tombstone.
-					return nil, false
-				default:
-					// For some reason, the pending record version would be valid for ours and maybe
-					// even for later transactions, even though our transaction is supposedly
-					// working on this record. Preclude further interference by giving up.
-					return fmt.Errorf("transaction with ID %d found pending record version for %q with later validity period ending with transaction %d", t.id, k, validBefore), false
-				}
-			}
-		case validAsOf <= t.id:
-			for {
-				switch validBefore := r.validBeforeTransactionID(); {
-				case validBefore == noSuchTransaction:
-					// We can't modify this active version in place: if we were to roll back the
-					// transaction, we'd need to undo this, and we don't want other transactions
-					// reading this record to observe this deletion yet. Insert a placeholder
-					// version here instead that we'll resolve later when committing.
-					proposedNewest := recordVersion{
-						value: r.value,
-						next:  r,
-					}
-					proposedNewest.validBeforeTransaction.Store(uint64(t.id))
-					if record.newest.CompareAndSwap(r, &proposedNewest) {
-						t.notePendingWriteAgainst(k)
-						return nil, true
-					}
-					// Someone else added a newer version.
-					return transactionInConflictError(k), false
-				case validBefore <= t.id:
-					// Someone else already deleted the record by marking it as a tombstone.
-					return nil, false
-				default:
-					// The pending record version would be valid for ours and maybe even for later
-					// transactions, so pull back the validity horizon.
-					if r.validBeforeTransaction.CompareAndSwap(uint64(validBefore), uint64(t.id)) {
-						return nil, false
-					}
-					// Someone else changed the validity horizon. We'll try again.
-					continue inspectNewest
-				}
-			}
-		default:
-			// A later transaction changed this record, but we should not inspect the record's state
-			// further here.
+	r := record.newest.Load()
+	if r == nil {
+		return nil, false
+	}
+	switch validAsOf := r.validAsOfTransactionID(); {
+	case validAsOf == noSuchTransaction:
+		if !t.hasPendingWriteAgainst(k) {
+			// A different transaction is trying to write to this record.
 			return transactionInConflictError(k), false
 		}
+		for {
+			switch validBefore := r.validBeforeTransactionID(); {
+			case validBefore == noSuchTransaction:
+				if r.validBeforeTransaction.CompareAndSwap(uint64(noSuchTransaction), uint64(t.id)) {
+					return nil, true
+				}
+				// Someone else changed the validity horizon. We'll try again.
+			case validBefore <= t.id:
+				// Someone else already deleted the record by marking it as a tombstone.
+				return nil, false
+			default:
+				// For some reason, the pending record version would be valid for ours and maybe
+				// even for later transactions, even though our transaction is supposedly
+				// working on this record. Preclude further interference by giving up.
+				return fmt.Errorf("transaction with ID %d found pending record version for %q with later validity period ending with transaction %d", t.id, k, validBefore), false
+			}
+		}
+	case validAsOf <= t.id:
+		for {
+			switch validBefore := r.validBeforeTransactionID(); {
+			case validBefore == noSuchTransaction:
+				// We can't modify this active version in place: if we were to roll back the
+				// transaction, we'd need to undo this, and we don't want other transactions
+				// reading this record to observe this deletion yet. Insert a placeholder
+				// version here instead that we'll resolve later when committing.
+				proposedNewest := recordVersion{
+					value: r.value,
+					next:  r,
+				}
+				proposedNewest.validBeforeTransaction.Store(uint64(t.id))
+				if record.newest.CompareAndSwap(r, &proposedNewest) {
+					t.notePendingWriteAgainst(k)
+					return nil, true
+				}
+				// Someone else added a newer version.
+				return transactionInConflictError(k), false
+			case validBefore <= t.id:
+				// Someone else already deleted the record by marking it as a tombstone.
+				return nil, false
+			default:
+				// A later transaction deleted or invalidated this version. Since it's possible
+				// that intervening transactions have observed this version being valid and made
+				// decisions based upon that finding, we can't just pull back the validity
+				// horizon here.
+				return transactionInConflictError(k), false
+			}
+		}
+	default:
+		// A later transaction changed this record, but we should not inspect the record's state
+		// further here.
+		return transactionInConflictError(k), false
 	}
 }
 
