@@ -28,10 +28,10 @@ func respondWithError(w http.ResponseWriter, err error) {
 	fmt.Fprintln(w, err)
 }
 
-const pathPrefix = "/record/"
+const pathPrefixSingleRecord = "/record/"
 
 func getTargetKey(w http.ResponseWriter, req *http.Request) (idb.Key, bool) {
-	key, ok := strings.CutPrefix(req.URL.Path, pathPrefix)
+	key, ok := strings.CutPrefix(req.URL.Path, pathPrefixSingleRecord)
 	if ok && len(key) > 0 {
 		return idb.Key(key), true
 	}
@@ -77,7 +77,7 @@ func handlePost(ctx context.Context, w http.ResponseWriter, req *http.Request, d
 	if err := req.ParseForm(); err != nil {
 		speakPlainTextTo(w)
 		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprintf(w, "Failed to parse HTTP form: %v", err)
+		fmt.Fprintf(w, "Failed to parse HTTP form: %v\n", err)
 		return
 	}
 	key, ok := getTargetKey(w, req)
@@ -136,8 +136,12 @@ func handlePut(ctx context.Context, w http.ResponseWriter, req *http.Request, db
 		}
 	}
 	if policy == insertIfAbsent {
-		// TODO(seh): Implement Upsert.
-		w.WriteHeader(http.StatusNotImplemented)
+		if err := db.WithinTransaction(ctx, func(ctx context.Context, tx idb.Transaction) (bool, error) {
+			err := tx.Upsert(ctx, key, idb.Value(value))
+			return err != nil, err
+		}); err != nil {
+			respondWithError(w, err)
+		}
 	} else {
 		var recordExisted bool
 		if err := db.WithinTransaction(ctx, func(ctx context.Context, tx idb.Transaction) (bool, error) {
@@ -184,7 +188,7 @@ func handleDelete(ctx context.Context, w http.ResponseWriter, req *http.Request,
 func makeHandler(db database) http.Handler {
 	var mux http.ServeMux
 	{
-		mux.Handle(pathPrefix,
+		mux.Handle(pathPrefixSingleRecord,
 			http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				switch req.Method {
 				case http.MethodGet:
@@ -200,6 +204,65 @@ func makeHandler(db database) http.Handler {
 					w.WriteHeader(http.StatusBadRequest)
 					fmt.Fprintf(w, "Request uses disallowed HTTP method %q\n", req.Method)
 					return
+				}
+			}))
+		mux.Handle("/records/batch",
+			http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.Method != http.MethodPost {
+					speakPlainTextTo(w)
+					w.WriteHeader(http.StatusBadRequest)
+					fmt.Fprintf(w, "Request uses disallowed HTTP method %q\n", req.Method)
+					return
+				}
+				if err := req.ParseForm(); err != nil {
+					speakPlainTextTo(w)
+					w.WriteHeader(http.StatusBadRequest)
+					fmt.Fprintf(w, "Failed to parse HTTP form: %v\n", err)
+					return
+				}
+				absentFormEntries := req.Form["absent"]
+				boundFormEntries := req.Form["bound"]
+				bindings := make(map[string]*idb.Value, len(absentFormEntries)+len(boundFormEntries))
+				for _, k := range absentFormEntries {
+					if len(k) == 0 {
+						continue
+					}
+					bindings[k] = nil
+				}
+				for _, v := range boundFormEntries {
+					if len(v) < 3 {
+						continue
+					}
+					delim := v[:1]
+					if before, after, ok := strings.Cut(v[1:], delim); ok && len(before) > 0 {
+						if _, ok := bindings[before]; ok {
+							speakPlainTextTo(w)
+							w.WriteHeader(http.StatusBadRequest)
+							fmt.Fprintf(w, "HTTP form requests ensuring key %q is both bound and absent\n", before)
+							return
+						}
+						value := idb.Value(after)
+						bindings[before] = &value
+					}
+				}
+				if len(bindings) == 0 {
+					return
+				}
+				if err := db.WithinTransaction(req.Context(), func(ctx context.Context, tx idb.Transaction) (bool, error) {
+					for key, value := range bindings {
+						var err error
+						if value == nil {
+							err, _ = tx.Delete(ctx, idb.Key(key))
+						} else {
+							err = tx.Upsert(ctx, idb.Key(key), *value)
+						}
+						if err != nil {
+							return false, err
+						}
+					}
+					return true, nil
+				}); err != nil {
+					respondWithError(w, err)
 				}
 			}))
 	}
