@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -473,21 +474,55 @@ func (s *ShardedStore) WithinTransaction(ctx context.Context, f func(context.Con
 	// this effort due to the governing Context having been canceled.
 	ctxFinalize := context.Background()
 	if commit {
+	pendingWrites:
 		for key := range tx.pendingWrites {
 			_, record, ok := tx.recordFor(ctxFinalize, Key(key))
 			if !ok {
 				continue
 			}
+		inspectNewest:
 			for newest := record.newest.Load(); newest != nil &&
 				newest.validAsOfTransactionID() == noSuchTransaction; newest = record.newest.Load() {
-				prev := newest.next
-				// If the newest record version has its "before transaction" value set indicating
-				// deletion, attempt to collapse it into the previous record version by copying down
-				// the "before transaction value".
-				if prev != nil && prev.validBeforeTransaction.CompareAndSwap(uint64(noSuchTransaction), uint64(tx.id)) {
-					if newest.validBeforeTransactionID() != noSuchTransaction &&
-						record.newest.CompareAndSwap(newest, prev) {
-						break
+				if prev := newest.next; prev != nil {
+					type proposedMutation uint8
+					const (
+						insertRecord proposedMutation = iota
+						updateRecord
+						deleteRecord
+					)
+					proposal := deleteRecord
+					if newest.validBeforeTransactionID() == noSuchTransaction {
+						if prev.validBeforeTransactionID() == noSuchTransaction {
+							proposal = updateRecord
+						} else {
+							proposal = insertRecord
+						}
+					}
+					switch proposal {
+					case insertRecord:
+						// We won't touch the preceding record version, which must have represented
+						// deletion.
+					case updateRecord:
+						// Avoid creating a new record version for a would-be update that doesn't
+						// change the record's value.
+						if bytes.Equal(newest.value, prev.value) {
+							if record.newest.CompareAndSwap(newest, prev) {
+								continue pendingWrites
+							} else {
+								continue inspectNewest
+							}
+						} else if !prev.validBeforeTransaction.CompareAndSwap(uint64(noSuchTransaction), uint64(tx.id)) {
+							continue inspectNewest
+						}
+					case deleteRecord:
+						// If the newest pending record version has its "before transaction" value set
+						// indicating deletion, and the preceding committed record version does not have
+						// that value set, attempt to collapse the pending record version into the
+						// previous record version by copying down the "before transaction value".
+						if prev.validBeforeTransaction.CompareAndSwap(uint64(noSuchTransaction), uint64(tx.id)) &&
+							record.newest.CompareAndSwap(newest, prev) {
+							continue pendingWrites
+						}
 					}
 				}
 				if newest.validAsOfTransaction.CompareAndSwap(uint64(noSuchTransaction), uint64(tx.id)) {
